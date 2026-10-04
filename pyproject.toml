@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epsilon-v1"
+version = "1.0.0"
+description = "Epsilon v1 — symbolic coding engine (Python+JS, syntax-verified)"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["epsilon*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

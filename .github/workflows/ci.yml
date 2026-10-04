@@ -1,0 +1,50 @@
+name: ci
+on:
+  push:
+    branches: ['main', 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main]
+permissions: { contents: read }
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ['3.11', '3.12']
+        node: ['20']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: ${{ matrix.python }} }
+      - uses: actions/setup-node@v4
+        with: { node-version: ${{ matrix.node }} }
+      - name: Install
+        run: pip install pytest
+      - name: Pytest
+        run: pytest -q -x --tb=short -p no:cacheprovider
+      - name: JS syntax check (generated samples)
+        run: |
+          python -c "
+          from epsilon import generate
+          from bench.bench import SPECS
+          import subprocess, tempfile, os
+          bad=0
+          for s in SPECS:
+              code=generate(s,lang='js')['code']
+              open('_tmp.js','w').write(code)
+              r=subprocess.run(['node','--check','_tmp.js'],capture_output=True,text=True)
+              if r.returncode!=0:
+                  print('JS-CHECK-FAIL',s,r.stderr[:300]); bad+=1
+          raise SystemExit(bad)
+          "
+      - name: Anti-hardcode check
+        run: |
+          ! grep -RniE 'def factorial\(n\):|def fibonacci|FizzBuzz.*Fizz.*Buzz' epsilon/ || { echo "HARDCODED PROGRAM FOUND"; exit 1; }
+          python -m pytest tests/test_epsilon.py::test_no_pasted_programs tests/test_epsilon.py::test_mutation_sensitivity -q -p no:cacheprovider
+      - name: Benchmark (quick)
+        run: python bench/bench.py
