@@ -36,6 +36,10 @@ def normalize(project: H.Project, events: EventLog | None = None) -> list[str]:
     warnings: list[str] = []
     lang = (project.language or 'python').lower()
     ext = EXT_MAP.get(lang, '.py')
+    if getattr(project, 'entry', ''):
+        base, dot, _old = project.entry.rpartition('.')
+        if dot and _old in ('py', 'js', 'ts'):
+            project.entry = base + ext
     for f in project.files:
         if type(f).__name__ != 'SourceFile':
             continue
@@ -86,8 +90,9 @@ def attach_models(project: H.Project) -> None:
         classes.append(H.ClassDef(name=m.name, bases=[], doc=m.doc,
                                   fields=list(m.fields), methods=[],
                                   decorators=['dataclass']))
-    if classes and not any(type(d).__name__ == 'Import' and d.module == 'dataclasses'
-                           for d in target.imports):
+    if classes and target.language == 'python' and not any(
+            type(d).__name__ == 'Import' and d.module == 'dataclasses'
+            for d in target.imports):
         target.imports.insert(0, H.Import(module='dataclasses', names=['dataclass']))
     target.declarations = classes + list(target.declarations)
 
@@ -165,8 +170,16 @@ def _int_guards(names, types):
     return out
 
 
-def enrich_behaviors(func) -> list[dict]:
-    """Planner {'behavior':k,'on':e} entries -> full snippet dicts with operands."""
+def enrich_behaviors(func, crud_project=True):
+    """Planner entries -> (full snippet dicts, strategy) with operands.
+
+    Strategy is one of 'crud', 'evenodd', 'specific:<kind>', 'generic' and
+    is recorded in project meta so test finalization uses the same decision
+    (single source of truth). Specific behaviors require their operands to
+    exist in the signature (a list source, a query second param); otherwise
+    the honest generic-identity path is taken instead of emitting references
+    to undefined names.
+    """
     names, types = _params_of(func)
     verb = (func.name or '').split('_')[0].lower()
     kinds = [ (e.get('behavior', e.get('kind', 'compute')) if isinstance(e, dict) else str(e))
@@ -176,36 +189,67 @@ def enrich_behaviors(func) -> list[dict]:
     primary = kinds[0]
     out: list[dict] = []
 
-    def L() -> str:
-        return _first_of(names, types, 'list') or 'items'
+    def L() -> str | None:
+        return _first_of(names, types, 'list')
 
     def I() -> str:
         return 'x'
 
+    def Q() -> str | None:
+        if 'query' in names:
+            return 'query'
+        if len(names) >= 2:
+            return names[1]
+        return None
+
     # -- CRUD verbs first (signature-driven; planner may map these verbs to
     # -- generic behaviors like accumulate, which must not shadow CRUD here).
-    if verb in ('add', 'create', 'append') and len(names) == 1:
-        p = names[0]
-        return [{'kind': 'guard-raise', 'pred': '%s == None' % p,
-                 'exc': 'TypeError', 'msg': 'null %s' % p},
-                {'kind': 'guard-raise', 'pred': '%s == ""' % p,
-                 'exc': 'ValueError', 'msg': 'empty %s' % p}]
-    if verb in ('delete', 'remove') and len(names) == 1:
-        p = names[0]
-        return [{'kind': 'guard-raise', 'pred': '%s < 0' % p,
-                 'exc': 'ValueError', 'msg': 'negative id'}]
-    if verb in ('update', 'edit', 'rename') and len(names) >= 2:
-        return [{'kind': 'guard-raise', 'pred': '%s < 0' % names[0],
-                 'exc': 'ValueError', 'msg': 'negative id'},
-                {'kind': 'guard-raise', 'pred': '%s == ""' % names[1],
-                 'exc': 'ValueError', 'msg': 'empty name'}]
-    if verb in ('list', 'show'):
-        return []
+    # -- Shape is checked on pre-normalization params (records excluded):
+    # -- materialize normalizes first, so 'records' present proves intent.
+    _types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
+              for p in (func.params or [])}
+    _base = [n for n in names if n != 'records']
+    _btypes = {n: t for n, t in _types.items() if n != 'records'}
+    if crud_project and 'records' in names \
+            and _crud_shape(verb, _base, _btypes):
+        if verb in ('add', 'create', 'append'):
+            p = names[0]
+            return ([{'kind': 'guard-raise', 'pred': '%s == None' % p,
+                      'exc': 'TypeError', 'msg': 'null %s' % p},
+                     {'kind': 'guard-raise', 'pred': '%s == ""' % p,
+                      'exc': 'ValueError', 'msg': 'empty %s' % p}], 'crud')
+        if verb in ('delete', 'remove'):
+            p = names[0]
+            return ([{'kind': 'guard-raise', 'pred': '%s < 0' % p,
+                      'exc': 'ValueError', 'msg': 'negative id'}], 'crud')
+        if verb in ('update', 'edit', 'rename'):
+            return ([{'kind': 'guard-raise', 'pred': '%s < 0' % names[0],
+                      'exc': 'ValueError', 'msg': 'negative id'},
+                     {'kind': 'guard-raise', 'pred': '%s == ""' % names[1],
+                      'exc': 'ValueError', 'msg': 'empty name'}], 'crud')
+        return ([], 'crud')
 
     # -- specific pure behaviors (operands inferred from signature) --
-    if primary in SPECIFIC_BEHAVIORS or verb in (
-            'sort', 'filter', 'count', 'average', 'reverse', 'dedupe'):
-        src = L()
+    _list_kinds = {'sort-by', 'filter-where', 'count-where', 'accumulate',
+                   'average', 'minmax-loop', 'dedupe', 'reverse-seq',
+                   'group-count', 'transform-each', 'none-where',
+                   'search-first'}
+    _query_kinds = {'filter-where', 'count-where', 'none-where',
+                    'search-first'}
+    _specific_hit = (
+        primary in SPECIFIC_BEHAVIORS or primary == 'recurse' or verb in (
+            'sort', 'filter', 'count', 'average', 'reverse', 'dedupe'))
+    _need_list = (primary in _list_kinds or (
+        _specific_hit and verb in (
+            'sort', 'filter', 'count', 'average', 'reverse', 'dedupe',
+            'transform', 'search', 'find', 'lookup', 'group', 'min', 'max')))
+    _need_query = (primary in _query_kinds or (
+        _specific_hit and verb in (
+            'filter', 'count', 'search', 'find', 'lookup')))
+    _operands_ok = (not _need_list or L() is not None) and (
+        not _need_query or Q() is not None)
+    if _specific_hit and _operands_ok:
+        src = L() or names[0]
         out.extend(_none_guards([src], types, 'TypeError'))
         if primary == 'sort-by' or verb == 'sort':
             out.append({'kind': 'sort-by', 'source': src, 'target': 'result',
@@ -274,16 +318,16 @@ def enrich_behaviors(func) -> list[dict]:
                         'msg': 'unplannable recursion for %s' % func.name})
         else:
             out.append({'kind': 'return-expr', 'expr': names[0] if names else 'None'})
-        return out
+        return (out, 'specific:' + primary)
 
     # -- even/odd by name (precedent: planner cases do the same) --
     low = func.name.lower()
-    if 'even' in low or 'odd' in low:
-        p = names[0] if names else 'n'
+    if ('even' in low or 'odd' in low) and names:
+        p = names[0]
         out.append({'kind': 'branch-return', 'branches': [
             {'pred': '%s %% 2 == 0' % p, 'value': "'even'"},
             {'pred': '%s %% 2 != 0' % p, 'value': "'odd'"}]})
-        return out
+        return (out, 'evenodd')
 
     # -- generic fallback: None -> ValueError, identity return --
     out.extend(_none_guards(names, types, 'ValueError'))
@@ -294,41 +338,60 @@ def enrich_behaviors(func) -> list[dict]:
         out.append({'kind': 'return-expr', 'expr': names[0]})
     else:
         out.append({'kind': 'return-expr', 'expr': 'None'})
-    return out
+    return (out, 'generic')
 
 
 def _crud_store_decls(lang: str = 'python') -> list:
-    # Counter lives inside _META (mutation only) so function bodies never
-    # rebind a module global — valid in both Python and JS without `global`.
-    meta_init = "{'next': 1}" if lang == 'python' else '{"next": 1}'
-    return [H.VarDecl(name='_STORE', type=H.TypeRef(name='dict'), value='{}'),
-            H.VarDecl(name='_META', type=H.TypeRef(name='dict'),
-                      value=meta_init)]
+    # Module store is only mutated, never rebound, so function bodies need
+    # no `global` declaration in any backend.
+    return [H.VarDecl(name='_STORE', type=H.TypeRef(name='dict'), value='{}')]
+
+
+def _records_param() -> object:
+    return H.Param(name='records', type=H.TypeRef(name='dict'),
+                   default='None', help='record store (default: module store)')
+
+
+def _store_resolve() -> list:
+    """store = records if given else the module store (both backends).
+
+    Declared up front: JS block scoping would otherwise trap the binding
+    inside the if/else branches (const does not leak).
+    """
+    return [H.Assign(target='store', value=H.Literal(value=None)),
+            H.If(cond=H.Compare(op='is', left=H.Var(name='records'),
+                                right=H.Literal(value=None)),
+                 then=[H.Assign(target='store', value=H.Var(name='_STORE'))],
+                 elifs=[], else_body=[H.Assign(
+                     target='store', value=H.Var(name='records'))])]
 
 
 def _crud_add_rest(func) -> list:
     p = func.params[0].name
     nid, rec = '_nid', 'record'
-    return [
-        H.Assign(target=nid, value=H.Subscript(
-            obj=H.Var(name='_META'), index=H.Literal(value='next'))),
+    return _store_resolve() + [
+        H.Assign(target=nid, value=H.BinOp(
+            op='+', left=H.Call(func=H.Var(name='len'),
+                                args=[H.Var(name='store')], kwargs={}),
+            right=H.Literal(value=1))),
+        H.While(cond=H.Compare(op='in', left=H.Var(name=nid),
+                               right=H.Var(name='store')),
+                body=[H.AugAssign(target=nid, op='+=',
+                                  value=H.Literal(value=1))]),
         H.Assign(target=rec, value=H.DictLit(pairs=[
             (H.Literal(value='id'), H.Var(name=nid)),
             (H.Literal(value='name'), H.Var(name=p))])),
-        H.IndexAssign(obj=H.Var(name='_STORE'), index=H.Var(name=nid),
+        H.IndexAssign(obj=H.Var(name='store'), index=H.Var(name=nid),
                       value=H.Var(name=rec)),
-        H.IndexAssign(obj=H.Var(name='_META'), index=H.Literal(value='next'),
-                      value=H.BinOp(op='+', left=H.Var(name=nid),
-                                    right=H.Literal(value=1))),
         H.Return(value=H.Var(name=rec)),
     ]
 
 
 def _crud_delete_rest(func) -> list:
     p = func.params[0].name
-    return [
+    return _store_resolve() + [
         H.Assign(target='removed', value=H.Call(
-            func=H.Attr(obj=H.Var(name='_STORE'), attr='pop'),
+            func=H.Attr(obj=H.Var(name='store'), attr='pop'),
             args=[H.Var(name=p), H.Literal(value=None)], kwargs={})),
         H.Return(value=H.Compare(op='is-not', left=H.Var(name='removed'),
                                  right=H.Literal(value=None))),
@@ -337,11 +400,11 @@ def _crud_delete_rest(func) -> list:
 
 def _crud_update_rest(func) -> list:
     pid, pname = func.params[0].name, func.params[1].name
-    return [
+    return _store_resolve() + [
         H.If(cond=H.Compare(op='not-in', left=H.Var(name=pid),
-                            right=H.Var(name='_STORE')),
+                            right=H.Var(name='store')),
              then=[H.Return(value=H.Literal(value=False))], elifs=[], else_body=[]),
-        H.IndexAssign(obj=H.Var(name='_STORE'), index=H.Var(name=pid),
+        H.IndexAssign(obj=H.Var(name='store'), index=H.Var(name=pid),
                       value=H.DictLit(pairs=[
                           (H.Literal(value='id'), H.Var(name=pid)),
                           (H.Literal(value='name'), H.Var(name=pname))])),
@@ -350,14 +413,52 @@ def _crud_update_rest(func) -> list:
 
 
 def _crud_list_rest(func) -> list:
-    return [H.Return(value=H.Call(func=H.Var(name='list'),
-                                 args=[H.Call(func=H.Attr(obj=H.Var(name='_STORE'), attr='values'),
-                                              args=[], kwargs={})], kwargs={}))]
+    return _store_resolve() + [
+        H.Return(value=H.Call(func=H.Var(name='list'),
+                              args=[H.Call(func=H.Attr(obj=H.Var(name='store'), attr='values'),
+                                           args=[], kwargs={})], kwargs={})),
+    ]
+
+
+def _crud_shape(verb: str, names: list, types: dict) -> bool:
+    """True only for planner CRUD signatures (not arithmetic lookalikes).
+
+    add_numbers(items) is accumulation; add_todo(name) is CRUD. The verb
+    alone cannot tell them apart — the parameter shape can.
+    """
+    t = lambda n: (types.get(n) or 'str')
+    if verb in ('add', 'create', 'append', 'delete', 'remove'):
+        return len(names) == 1 and t(names[0]) != 'list'
+    if verb in ('update', 'edit', 'rename'):
+        return len(names) == 2 and t(names[0]) != 'list' \
+            and t(names[1]) != 'list'
+    if verb in ('list', 'show'):
+        return len(names) == 1
+    return False
+
+
+def _crud_project_verbs(project: H.Project) -> bool:
+    """CRUD normalization needs corroboration: >=2 distinct CRUD-family
+    verbs project-wide (same philosophy as type detection). A lone
+    add_numbers next to subtract/multiply is arithmetic, not a store."""
+    seen = set()
+    for f in project.files or []:
+        if type(f).__name__ != 'SourceFile':
+            continue
+        for d in f.declarations or []:
+            if type(d).__name__ != 'FuncDef':
+                continue
+            v = (d.name or '').split('_')[0].lower()
+            if v in ('add', 'create', 'append', 'delete', 'remove',
+                     'update', 'edit', 'rename', 'list', 'show'):
+                seen.add(v)
+    return len(seen) >= 2
 
 
 def materialize_bodies(project: H.Project) -> None:
     """Fill empty function bodies from behavior entries. Mutates project."""
     from .snippets import build_body
+    crud_project = _crud_project_verbs(project)
     for f in project.files:
         if type(f).__name__ != 'SourceFile':
             continue
@@ -393,31 +494,60 @@ def materialize_bodies(project: H.Project) -> None:
             if body and not (len(body) == 1 and type(body[0]).__name__ == 'Pass'):
                 continue
             verb = (d.name or '').split('_')[0].lower()
-            enriched = enrich_behaviors(d)
-            stmts = build_body(enriched, d.name, [p.name for p in d.params or []])
-            # CRUD raw-HIR tails (store-backed semantics)
+            # Normalize CRUD signatures (documented): an explicit store
+            # parameter keeps generated tests order-independent; callers may
+            # pass records=None to use the module store (CLI dispatch does).
+            # Shape-gated: add_numbers(items) stays accumulation.
             names = [p.name for p in d.params or []]
-            if verb in ('add', 'create', 'append') and names:
+            types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
+                     for p in d.params or []}
+            if crud_project and verb in ('add', 'create', 'append', 'delete',
+                         'remove', 'update', 'edit', 'rename', 'list',
+                         'show') and _crud_shape(verb, names, types):
+                if verb in ('list', 'show'):
+                    d.params = [_records_param()]
+                elif 'records' not in names:
+                    d.params = list(d.params or []) + [_records_param()]
+                names = [p.name for p in d.params]
+                types = {p.name: (p.type.name if getattr(p, 'type', None)
+                                  else 'str') for p in d.params}
+            enriched, strategy = enrich_behaviors(d, crud_project)
+            stmts = build_body(enriched, d.name, [p.name for p in d.params or []])
+            # CRUD raw-HIR tails (explicit-store semantics; same gate)
+            names = [p.name for p in d.params or []]
+            if crud_project and verb in ('add', 'create', 'append') \
+                    and 'records' in names:
                 stmts = [s for s in stmts] + _crud_add_rest(d)
                 need_store = True
                 d.returns = H.TypeRef(name='dict')
-            elif verb in ('delete', 'remove') and names:
+                strategy = 'crud-add'
+            elif crud_project and verb in ('delete', 'remove') \
+                    and 'records' in names:
                 stmts = [s for s in stmts] + _crud_delete_rest(d)
                 need_store = True
                 d.returns = H.TypeRef(name='bool')
-            elif verb in ('update', 'edit', 'rename') and len(names) >= 2:
+                strategy = 'crud-delete'
+            elif crud_project and verb in ('update', 'edit', 'rename') \
+                    and len(names) >= 3 and 'records' in names:
                 stmts = [s for s in stmts] + _crud_update_rest(d)
                 need_store = True
                 d.returns = H.TypeRef(name='bool')
-            elif verb in ('list', 'show'):
+                strategy = 'crud-update'
+            elif crud_project and verb in ('list', 'show') \
+                    and names == ['records']:
                 # identity returns from enrich would shadow the store tail;
                 # drop them so the store tail is the live return.
                 stmts = [s for s in stmts if type(s).__name__ != 'Return']
                 stmts = stmts + _crud_list_rest(d)
                 need_store = True
-                d.params = []
                 d.returns = H.TypeRef(name='list')
+                strategy = 'crud-list'
             d.body = stmts or [H.Pass()]
+            try:
+                project.meta.setdefault('body_strategy', {})[
+                    '%s::%s' % (f.path, d.name)] = strategy
+            except Exception:
+                pass
         if need_store and not any(type(x).__name__ == 'VarDecl' and x.name == '_STORE'
                                   for x in f.declarations or []):
             f.declarations = _crud_store_decls(file_lang) + list(f.declarations or [])
@@ -767,6 +897,11 @@ def build_store_io(project: H.Project) -> None:
             if d.name.startswith('load_') and not is_sql:
                 path = d.params[0].name if d.params else 'path'
                 d.body = [
+                    H.If(cond=H.Compare(op='==', left=H.Var(name=path),
+                                        right=H.Literal(value=None)),
+                         then=[H.Raise(exc='ValueError',
+                                       message=H.Literal(value='null %s' % path))],
+                         elifs=[], else_body=[]),
                     H.Try(body=[
                         H.With(items=[(H.Call(func=H.Var(name='open'),
                                                      args=[H.Var(name=path)],
@@ -782,12 +917,17 @@ def build_store_io(project: H.Project) -> None:
                 recs = d.params[0].name if d.params else 'records'
                 path = d.params[1].name if len(d.params) > 1 else 'path'
                 d.body = [
+                    H.If(cond=H.Compare(op='==', left=H.Var(name=recs),
+                                        right=H.Literal(value=None)),
+                         then=[H.Raise(exc='ValueError',
+                                       message=H.Literal(value='null %s' % recs))],
+                         elifs=[], else_body=[]),
                     H.With(items=[(H.Call(func=H.Var(name='open'),
-                                                 args=[H.Var(name=path)],
-                                                 kwargs={'mode': H.Literal(value='w')}), 'fh')],
-                           body=[H.ExprStmt(expr=H.Call(
-                               func=H.Attr(obj=H.Var(name='json'), attr='dump'),
-                               args=[H.Var(name=recs), H.Var(name='fh')], kwargs={}))]),
+                                                  args=[H.Var(name=path)],
+                                                  kwargs={'mode': H.Literal(value='w')}), 'fh')],
+                            body=[H.ExprStmt(expr=H.Call(
+                                func=H.Attr(obj=H.Var(name='json'), attr='dump'),
+                                args=[H.Var(name=recs), H.Var(name='fh')], kwargs={}))]),
                     H.Return(value=H.Call(func=H.Var(name='len'),
                                           args=[H.Var(name=recs)], kwargs={})),
                 ]
@@ -800,8 +940,15 @@ def build_store_io(project: H.Project) -> None:
 # test finalization: cases the bodies actually guarantee
 # --------------------------------------------------------------------------
 
-def my_cases_for(func, dotted: str) -> list:
-    """Behavioral cases consistent with materialize_bodies semantics."""
+def my_cases_for(func, dotted: str, strategy=None) -> list | None:
+    """Behavioral cases consistent with materialized bodies.
+
+    Strategy comes from materialize_bodies (recorded in project meta):
+    'crud-*' -> store cases, 'evenodd' -> parity cases, 'generic' ->
+    identity cases, anything else (specific behaviors with verified
+    operands, or concrete planner bodies) -> None (keep planner's cases,
+    which were built from the same behavior table).
+    """
     from .hir import TestCase
     names = [p.name for p in func.params or []]
     verb = (func.name or '').split('_')[0].lower()
@@ -816,40 +963,69 @@ def my_cases_for(func, dotted: str) -> list:
             kw['raises'] = raises
         return TestCase(**kw)
 
-    if verb in ('add', 'create', 'append') and names:
-        p = names[0]
-        return [C({p: 'Buy milk'}, "{'id': 1, 'name': 'Buy milk'}", note='normal: add stores record'),
-                C({p: ''}, raises='ValueError', note='edge: empty name rejected'),
-                C({p: None}, raises='TypeError', note='invalid: null name raises')]
-    if verb in ('delete', 'remove') and names:
-        return [C({names[0]: 1}, 'True', note='normal: known id removed'),
-                C({names[0]: 999}, 'False', note='edge: unknown id removes nothing'),
-                C({names[0]: -1}, raises='ValueError', note='invalid: negative id raises')]
-    if verb in ('update', 'edit', 'rename') and len(names) >= 2:
-        return [C({names[0]: 2, names[1]: 'New'}, 'False', note='normal: unknown id updates nothing'),
-                C({names[0]: 1, names[1]: ''}, raises='ValueError', note='invalid: empty name raises'),
-                C({names[0]: -1, names[1]: 'x'}, raises='ValueError', note='invalid: negative id raises')]
-    if verb in ('list', 'show') and not names:
-        return [C({}, '[]', note='normal: empty store lists empty')]
-    if verb in ('search', 'find', 'lookup'):
-        return [C({'items': [1, 2, 3], 'query': 2}, '2', note='normal: first match'),
-                C({'items': [], 'query': 2}, 'None', note='edge: empty finds nothing'),
-                C({'items': [1], 'query': None}, raises='ValueError', note='invalid: null query')]
-    if verb == 'sort':
-        return [C({'items': [3, 1, 2]}, '[1, 2, 3]', note='normal: sorted'),
-                C({'items': []}, '[]', note='edge: empty'),
-                C({'items': None}, raises='TypeError', note='invalid: null')]
-    if verb == 'filter':
-        q = 'query' if 'query' in names else names[-1]
-        return [C({'items': [1, 2, 3], q: 2}, '[2]', note='normal: keeps matches'),
-                C({'items': [], q: 2}, '[]', note='edge: empty'),
-                C({'items': None, q: 2}, raises='TypeError', note='invalid: null')]
-    if verb == 'count':
-        q = 'query' if 'query' in names else names[-1]
-        return [C({'items': [1, 2, 3], q: 2}, '1', note='normal: one match'),
-                C({'items': [], q: 2}, '0', note='edge: empty'),
-                C({'items': None, q: 2}, raises='TypeError', note='invalid: null')]
-    if 'even' in low or 'odd' in low:
+    if verb in ('add', 'create', 'append') and strategy == 'crud-add' \
+            and 'records' in names:
+        p0, pr = names[0], names[1]
+        rec1 = {'id': 1, 'name': 'Buy milk'}
+        return [C({p0: 'Buy milk', pr: {}}, repr(rec1),
+                   note='normal: add stores record'),
+                C({p0: 'A', pr: {7: {'id': 7, 'name': 'Z'}}},
+                   repr({'id': 2, 'name': 'A'}),
+                   note='edge: id avoids collision'),
+                C({p0: '', pr: {}}, raises='ValueError',
+                   note='invalid: empty name rejected'),
+                C({p0: None, pr: {}}, raises='TypeError',
+                   note='invalid: null name raises')]
+    if verb in ('delete', 'remove') and strategy == 'crud-delete' \
+            and 'records' in names:
+        p0, pr = names[0], names[1]
+        return [C({p0: 1, pr: {1: {'id': 1, 'name': 'Buy milk'}}},
+                   'True', note='normal: known id removed'),
+                C({p0: 999, pr: {}}, 'False',
+                   note='edge: unknown id removes nothing'),
+                C({p0: -1, pr: {}}, raises='ValueError',
+                   note='invalid: negative id raises')]
+    if verb in ('update', 'edit', 'rename') and strategy == 'crud-update' \
+            and 'records' in names and len(names) >= 3:
+        p0, p1, pr = names[0], names[1], names[2]
+        return [C({p0: 1, p1: 'New',
+                    pr: {1: {'id': 1, 'name': 'Old'}}}, 'True',
+                   note='normal: known id updated'),
+                C({p0: 999, p1: 'New', pr: {}}, 'False',
+                   note='edge: unknown id updates nothing'),
+                C({p0: 1, p1: '', pr: {}}, raises='ValueError',
+                   note='invalid: empty name raises')]
+    if verb in ('list', 'show') and strategy == 'crud-list' \
+            and names == ['records']:
+        rec1 = {'id': 1, 'name': 'Buy milk'}
+        return [C({'records': {1: dict(rec1)}}, repr([dict(rec1)]),
+                   note='normal: lists stored records'),
+                C({'records': {}}, '[]',
+                   note='edge: empty store lists empty')]
+    if strategy and strategy.startswith('specific'):
+        _types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
+                  for p in func.params or []}
+        _src = next((n for n in names if _types.get(n) == 'list'), None)
+        _q = 'query' if 'query' in names else (
+            names[1] if len(names) > 1 else None)
+        if verb in ('search', 'find', 'lookup') and _src and _q:
+            return [C({_src: [1, 2, 3], _q: 2}, '2', note='normal: first match'),
+                    C({_src: [], _q: 2}, 'None', note='edge: empty finds nothing'),
+                    C({_src: [1], _q: None}, raises='ValueError', note='invalid: null query')]
+        if verb == 'sort' and _src:
+            return [C({_src: [3, 1, 2]}, '[1, 2, 3]', note='normal: sorted'),
+                    C({_src: []}, '[]', note='edge: empty'),
+                    C({_src: None}, raises='TypeError', note='invalid: null')]
+        if verb == 'filter' and _src and _q:
+            return [C({_src: [1, 2, 3], _q: 2}, '[2]', note='normal: keeps matches'),
+                    C({_src: [], _q: 2}, '[]', note='edge: empty'),
+                    C({_src: None, _q: 2}, raises='TypeError', note='invalid: null')]
+        if verb == 'count' and _src and _q:
+            return [C({_src: [1, 2, 3], _q: 2}, '1', note='normal: one match'),
+                    C({_src: [], _q: 2}, '0', note='edge: empty'),
+                    C({_src: None, _q: 2}, raises='TypeError', note='invalid: null')]
+        return None  # other specific behaviors: planner cases already match
+    if ('even' in low or 'odd' in low) and strategy == 'evenodd':
         p = names[0] if names else 'n'
         return [C({p: 4}, "'even'", note='normal: 4 is even'),
                 C({p: 7}, "'odd'", note='normal: 7 is odd'),
@@ -857,6 +1033,27 @@ def my_cases_for(func, dotted: str) -> list:
     if low.startswith('load_'):
         return [C({'path': 'eps_missing_xyz.json'}, '[]', note='edge: missing file loads empty'),
                 C({'path': None}, raises='ValueError', note='invalid: null path')]
+    # Generic identity fallback: only when enrich took its generic path
+    # (strategy recorded in meta). Anything else keeps planner cases.
+    if strategy != 'generic':
+        return None
+    if not names or 'records' in names:
+        return None
+    _samples = {'int': 3, 'float': 2.5, 'bool': True, 'list': [3, 1, 2],
+                'dict': {'key': 'value'}, 'str': 'sample'}
+    _zeros = {'int': 0, 'float': 0.0, 'bool': False, 'list': [],
+              'dict': {}, 'str': ''}
+    _types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
+              for p in func.params or []}
+    sample = {n: _samples.get(_types.get(n, 'str'), 'sample') for n in names}
+    first = names[0]
+    zero = {n: _zeros.get(_types.get(n, 'str'), '') for n in names}
+    return [C(dict(sample), repr(sample[first]),
+               note='normal: identity over sample input'),
+            C(dict(zero), repr(_zeros.get(_types.get(first, 'str'), '')),
+               note='edge: zero input passes through'),
+            C({first: None}, raises='ValueError',
+               note='invalid: null input raises')]
     if low == 'step' and len(names) >= 2:
         return [C({names[0]: {'x': 1}, names[1]: 'tick'}, "{'x': 1}",
                    note='normal: step passes state through'),
@@ -877,8 +1074,12 @@ def my_cases_for(func, dotted: str) -> list:
                    note='invalid: null records')]
     # API handlers by method embedded in name stem (planner bodies return
     # the literal (status, {}) contract; cases assert exactly that shape).
-    if low.startswith('get_') or low.startswith('post_') or low.startswith('put_') \
-            or low.startswith('delete_') or low.startswith('patch_'):
+    # Guarded to api.py files: domain functions may share verb prefixes
+    # (get_notes vs get_noteses) but have identity semantics instead.
+    if ('api' in dotted.split('.') and
+            (low.startswith('get_') or low.startswith('post_') or
+             low.startswith('put_') or low.startswith('delete_') or
+             low.startswith('patch_'))):
         sample = {n: ('sample' if (t == 'str') else 1) for n, t in
                   [(p.name, p.type.name if getattr(p, 'type', None) else 'str') for p in func.params or []]}
         return [C(dict(sample), '(200, {})', note='smoke: handler returns status/body')]
@@ -889,6 +1090,12 @@ def my_cases_for(func, dotted: str) -> list:
 def finalize_tests(project: H.Project) -> None:
     """Replace planner TestSpecs with cases the materialized bodies guarantee."""
     specs = []
+    strategies = {}
+    try:
+        meta = getattr(project, 'meta', {}) or {}
+        strategies = meta.get('body_strategy', {}) or {}
+    except Exception:
+        strategies = {}
     for f in project.files:
         if type(f).__name__ != 'SourceFile':
             continue
@@ -897,11 +1104,12 @@ def finalize_tests(project: H.Project) -> None:
             if dotted.endswith(suffix):
                 dotted = dotted[:-len(suffix)]
         for d in f.declarations or []:
-            if type(d).__name__ != 'FuncDef' or not d.params:
+            if type(d).__name__ != 'FuncDef':
                 continue
             if d.name.startswith('_'):
                 continue
-            mine = my_cases_for(d, dotted)
+            strategy = strategies.get('%s::%s' % (f.path, d.name))
+            mine = my_cases_for(d, dotted, strategy)
             if mine is None:
                 continue  # keep planner spec for this one
             specs.append(H.TestSpec(name=re.sub(r'^test_', '', 'test_%s' % d.name),
@@ -921,6 +1129,31 @@ def finalize_tests(project: H.Project) -> None:
 # --------------------------------------------------------------------------
 # build orchestrator
 # --------------------------------------------------------------------------
+
+def _restore_from_plan(out_dir: str, project, rel: str, events=None) -> bool:
+    """Re-render one file from pristine HIR and rewrite it. True if changed."""
+    from .backends import get_backend
+    for f in project.files or []:
+        if type(f).__name__ == 'SourceFile' and f.path == rel:
+            try:
+                content = get_backend(project.language).render_file(f)
+            except Exception:
+                return False
+            full = os.path.join(out_dir, rel)
+            try:
+                with open(full) as fh:
+                    if fh.read() == content:
+                        return False
+                with open(full, 'w') as fh:
+                    fh.write(content)
+            except OSError:
+                return False
+            if events is not None:
+                events.emit('repair', 'repaired',
+                            'restored %s from plan' % rel, {'file': rel})
+            return True
+    return False
+
 
 def write_files(out_dir: str, files: dict[str, str]) -> list[str]:
     written = []
@@ -992,18 +1225,32 @@ def build(spec: str, config: EpsilonConfig | None = None,
     repairs: list = []
     verdicts: list[Verdict] = []
     test_res: dict = {'state': UNKNOWN}
+    smoke: dict = {'state': UNKNOWN}
+    stage_secs: dict = {}
     iters = 0
     while True:
+        _t = time.time()
         verdicts = V.validate_project(out_dir, project, config, events)
+        stage_secs['validate'] = round(stage_secs.get('validate', 0.0) +
+                                       (time.time() - _t), 3)
         fatal = [v for v in verdicts if v.state == FAIL]
         if config.run_tests:
+            _t = time.time()
             test_res = SB.run_tests(out_dir, config.target_language, config.timeout_secs)
+            stage_secs['tests'] = round(stage_secs.get('tests', 0.0) +
+                                        (time.time() - _t), 3)
         else:
             test_res = {'state': UNKNOWN, 'reason': 'run_tests disabled'}
-        smoke = SB.check_smoke(out_dir, project.entry, config.target_language, 10)
-        if not fatal and test_res.get('state') in (PASS, UNKNOWN, UNAVAILABLE) and iters > 0:
-            break
-        if not fatal and test_res.get('state') in (PASS, UNKNOWN, UNAVAILABLE):
+        clean = not fatal and test_res.get('state') in (PASS, UNKNOWN,
+                                                        UNAVAILABLE)
+        if clean:
+            # Smoke only when everything else is green: it spawns a process
+            # and can hang a port, so never pay for it on a failing build.
+            _t = time.time()
+            smoke = SB.check_smoke(out_dir, project.entry,
+                                   config.target_language, 10)
+            stage_secs['smoke'] = round(stage_secs.get('smoke', 0.0) +
+                                        (time.time() - _t), 3)
             break
         if iters >= config.repair_iterations:
             break
@@ -1016,6 +1263,13 @@ def build(spec: str, config: EpsilonConfig | None = None,
             events.emit('repair', 'failed', 'repair crashed: %s' % e, {})
             break
         repairs.extend(attempts)
+        # Honor plan-restore hints: re-render the single file from pristine
+        # HIR (text diverged from plan => restoring from plan is minimal).
+        for a in attempts:
+            rel = getattr(a, 'file', '')
+            if getattr(a, 'result', '') == 'needs-regeneration' and rel:
+                if _restore_from_plan(out_dir, project, rel, events):
+                    changed = True
         if not changed:
             break
     verdicts = V.validate_project(out_dir, project, config, events)
@@ -1028,7 +1282,8 @@ def build(spec: str, config: EpsilonConfig | None = None,
     else:
         state = FAIL
     metrics = {'seconds': round(time.time() - t0, 2), 'repair_iterations': iters,
-               'files': len(written)}
+               'files': len(written), 'stage_secs': stage_secs,
+               'smoke': smoke.get('state') if isinstance(smoke, dict) else 'UNKNOWN'}
     report = ProjectReport(state=state, verdicts=verdicts, tests=test_res,
                            repairs=[a.__dict__ if hasattr(a, '__dict__') else a for a in repairs],
                            files=written, metrics=metrics)

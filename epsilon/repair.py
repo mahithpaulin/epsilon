@@ -754,6 +754,153 @@ def _repair_manifest(rel: str, content: str, file_errors, project):
     return attempts, patched
 
 
+def _failing_test_modules(tests) -> list[str]:
+    """Module paths (tests/test_x.py) of failing tests from runner output."""
+    if not isinstance(tests, dict):
+        return []
+    blob = str(tests.get('stderr') or '') + '\n' + str(tests.get('stdout') or '')
+    mods = []
+    for line in blob.split('\n'):
+        m = re.match(r'^(?:FAIL|ERROR): \w+ \(([\w.]+)\.', line.strip())
+        if m:
+            mod = m.group(1)
+            first = mod.split('.')[0]
+            if mod.startswith('tests.') and len(mod.split('.')) > 1:
+                mods.append('tests/' + mod.split('.', 1)[1].split('.')[0] + '.py')
+            elif first.startswith('test_'):
+                # discover-style IDs without the package prefix
+                mods.append('tests/' + first + '.py')
+    seen, out = set(), []
+    for p in mods:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _targets_of_test_file(out_dir, rel):
+    """Read TARGET_PATH dotted targets from a generated test file."""
+    out = []
+    try:
+        with open(os.path.join(out_dir, rel), encoding='utf-8') as fh:
+            for line in fh.read().split('\n')[:40]:
+                m = re.match(r"""\s*TARGET_PATH\s*=\s*['"]([^'"]+)['"]""", line)
+                if m:
+                    out.append(m.group(1))
+    except OSError:
+        pass
+    return out
+
+
+def _source_for_target(project, dotted, language):
+    """Dotted 'pkg.mod.func' -> project source path for mod."""
+    parts = (dotted or '').split('.')
+    if len(parts) < 2:
+        return None
+    mod = '.'.join(parts[:-1])
+    ext = {'python': '.py', 'javascript': '.js', 'typescript': '.ts'}.get(
+        (language or 'python').lower(), '.py')
+    cands = {mod.replace('.', '/') + ext}
+    for f in _get(project, 'files', []) or []:
+        p = _get(f, 'path', '')
+        if p in cands or p.replace('.py', ext) in cands:
+            return _get(f, 'path', '') or None
+    return None
+
+
+def _symptom_from_tests(tests) -> str:
+    """Redacted defect symptom (issue-text analog): assertion diffs and error
+    lines with file paths and test identifiers stripped. The repair loop sees
+    WHAT is wrong, never WHICH test file says so."""
+    if not isinstance(tests, dict):
+        return ''
+    blob = str(tests.get('stderr') or '') + '\n' + str(tests.get('stdout') or '')
+    kept = []
+    for line in blob.split('\n'):
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r'^(FAIL|ERROR): ', s):
+            s = re.sub(r'^(FAIL|ERROR): \w+ \([\w.]+\)', r'\1: <test>', s)
+            kept.append(s)
+        elif s.startswith(('AssertionError', 'TypeError', 'ValueError',
+                           'KeyError', 'IndexError', 'AttributeError',
+                           'NotImplementedError', 'Exception')):
+            kept.append(re.sub(r'File "[^"]+", line \d+', 'File <redacted>', s))
+        elif s.startswith(('+', '-', '?')) and len(s) > 2:
+            kept.append(s)
+    return '\n'.join(kept[:20])
+
+
+def _targeted_regen(project, targets, config, ctx, events, limit):
+    """needs-regeneration for harness-named targets (issue-text analog).
+
+    Used when failing test files are hidden: the harness names implicated
+    dotted targets WITHOUT revealing expected values. Labeled oracle-assisted
+    wherever reported (see docs/SWE_MINI.md). Bounded by limit.
+    """
+    attempts = []
+    try:
+        base = len(_get(ctx, 'repairs', []) or [])
+    except TypeError:
+        base = 0
+    language = _get(project, 'language', 'python')
+    seen = set()
+    for dotted in targets or []:
+        if len(attempts) >= limit:
+            break
+        rel = _source_for_target(project, dotted, language)
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        attempts.append(RepairAttempt(
+            file=rel, strategy='targeted-regen', result='needs-regeneration',
+            detail='harness-named target %s (oracle-assisted); restore file '
+                   'from plan' % dotted))
+    for a in attempts:
+        a.iteration = base
+        _record(ctx, events, a)
+    return attempts
+
+
+def _test_driven_regen(out_dir, project, report, config, ctx, events,
+                       limit):
+    """needs-regeneration hints for files implicated by failing tests.
+
+    Fires only when validation produced no fix (changed=False) yet tests
+    fail: the plan (HIR) is intact but generated text diverged, so the
+    orchestrator restoring the file from plan is the minimal correct patch.
+    Never edits anything itself.
+    """
+    tests = _get(report, 'tests', {}) or {}
+    if not isinstance(tests, dict) or tests.get('state') != 'FAIL':
+        return []
+    language = _get(project, 'language', 'python')
+    attempts = []
+    try:
+        base = len(_get(ctx, 'repairs', []) or [])
+    except TypeError:
+        base = 0
+    seen = set()
+    for trel in _failing_test_modules(tests):
+        if len(attempts) >= limit:
+            break
+        for dotted in _targets_of_test_file(out_dir, trel) or []:
+            rel = _source_for_target(project, dotted, language)
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            attempts.append(RepairAttempt(
+                file=rel, strategy='test-driven-regen',
+                result='needs-regeneration',
+                detail='failing tests implicate %s; restore from plan' % dotted))
+            break
+    for a in attempts:
+        a.iteration = base
+        _record(ctx, events, a)
+    return attempts
+
+
 def repair(out_dir, project, report, config, ctx, events=None):
     """Attempt bounded repairs for errors in report. See module docstring.
 
@@ -828,4 +975,16 @@ def repair(out_dir, project, report, config, ctx, events=None):
             a.iteration = base
             _record(ctx, events, a)
             attempts.append(a)
+    if not changed:
+        # Validation produced no fix but tests fail: point at plan restore.
+        remaining = max(0, limit - processed)
+        if remaining:
+            attempts.extend(_test_driven_regen(
+                out_dir, project, report, config, ctx, events, remaining))
+            remaining = max(0, limit - processed - len(attempts))
+            tests = _get(report, 'tests', {}) or {}
+            targets = tests.get('targets') if isinstance(tests, dict) else None
+            if remaining and targets:
+                attempts.extend(_targeted_regen(
+                    project, targets, config, ctx, events, remaining))
     return changed, attempts

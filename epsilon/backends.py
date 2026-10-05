@@ -23,8 +23,17 @@ def get_backend(language: str):
         be = JsBackend(mode='ts' if lang in ('typescript', 'ts') else 'js')
         REGISTRY[lang] = be
         return be
-    raise ValueError("unsupported language %r: expected python|javascript|typescript" % (language,))
+    # 25 table-driven languages (2.5 experimental): generic renderer.
+    from .lang_tables import BY_NAME
+    if lang in BY_NAME:
+        from .gen_table import TableBackend
+        be = TableBackend(BY_NAME[lang])
+        REGISTRY[lang] = be
+        return be
+    raise ValueError("unsupported language %r: expected python|javascript|typescript|%s"
+                     % (language, '|'.join(sorted(BY_NAME))))
 
 
 def supported_languages() -> list[str]:
-    return ['python', 'javascript', 'typescript']
+    from .lang_tables import BY_NAME
+    return ['python', 'javascript', 'typescript'] + sorted(BY_NAME)

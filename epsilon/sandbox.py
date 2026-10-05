@@ -337,12 +337,20 @@ def run_tests(out_dir, language, timeout) -> dict:
                 "stderr": "node not found",
             }
         node = shutil.which("node") or "node"
-        if os.path.isdir(os.path.join(out_s, "tests")):
-            argv = [node, "--test", "tests/"]
-        elif os.path.isdir(os.path.join(out_s, "test")):
-            argv = [node, "--test", "test/"]
-        else:
-            argv = [node, "--test"]
+        # Pass explicit test files: `node --test <dir>` tries to LOAD the
+        # directory as a module instead of discovering inside it.
+        test_files = []
+        for sub in ("tests", "test"):
+            d = os.path.join(out_s, sub)
+            if os.path.isdir(d):
+                for fn in sorted(os.listdir(d)):
+                    if fn.endswith(('.test.js', '.test.ts', '.test.mjs',
+                                    '_test.js')) or (
+                                        fn.startswith('test') and
+                                        fn.endswith(('.js', '.ts'))):
+                        test_files.append(os.path.join(sub, fn))
+                break
+        argv = [node, "--test"] + test_files if test_files else [node, "--test"]
         res = run(argv, out_s, timeout_f)
         combined = (res.stdout or "") + "\n" + (res.stderr or "")
         # node --test summary: old TAP '# pass N' / '# fail N', new

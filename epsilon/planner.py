@@ -416,8 +416,10 @@ def _code_name(name, default='Item'):
 def _plural(snake):
     if re.search(r'[^aeiou]y$', snake):
         return snake[:-1] + 'ies'
-    if snake.endswith('s'):
-        return snake + 'es'
+    if snake.endswith(('s', 'x', 'ch', 'sh')):
+        # Treat sibilant endings as already plural (notes, glass). Building
+        # a full pluralizer is out of scope; route names stay readable.
+        return snake
     return snake + 's'
 
 
@@ -1321,7 +1323,7 @@ def config_files(language, package='app', title='app'):
         files.append(H.ConfigFile(
             path='package.json', format='json',
             data={'name': pkg, 'version': '0.1.0',
-                  'description': label, 'type': 'module',
+                  'description': label, 'type': 'commonjs',
                   'scripts': {'test': 'node --test'}},
             comment='Package manifest for %s.' % label))
         files.append(H.ConfigFile(

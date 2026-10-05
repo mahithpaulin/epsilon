@@ -218,6 +218,8 @@ def _js_expect_block(expect) -> list[str]:
     if not literal_ok:
         return ['// non-literal expect from spec; compared as an expression',
                 'assert.strictEqual(actual, (%s));' % expect]
+    if isinstance(py_value, (dict, list)):
+        return ['assert.deepStrictEqual(actual, %s);' % js_lit]
     return ['assert.strictEqual(actual, %s);' % js_lit]
     L.append('    assert.strictEqual(%s, %s);' % (actual_call, js_lit))
     return L
@@ -243,6 +245,12 @@ def _js_file(spec_name: str, target: str, cases: list, setup: str,
     L.append('')
     if setup and str(setup).strip():
         for line in str(setup).splitlines():
+            s = line.strip()
+            # Planner emits python-style `import dotted.path` setups; the
+            # TARGET require above already loads the module, so translate.
+            if re.match(r'^import\s+[A-Za-z_][\w.]*$', s):
+                L.append('// setup import handled by TARGET require')
+                continue
             L.append(line.rstrip())
         L.append('')
     if not cases:
@@ -260,13 +268,24 @@ def _js_file(spec_name: str, target: str, cases: list, setup: str,
             L.append('  // unrepresentable given value; manual review needed')
             L.append('});')
             continue
+        # Call shape: defaulted params don't count in fn.length, so decide
+        # by VALUE shape. Arrays spread iff the function takes 2+ (tuples
+        # are positional); plain objects spread their values iff 2+ keys
+        # or the function takes 2+ (dict key order == param order); a
+        # single-key object for a 1-param function unwraps (kwargs analog).
+        L.append('  const _given = %s;' % (args[1:-1] if args.startswith('(') and args.endswith(')') else args))
+        L.append('  const _isArr = Array.isArray(_given);')
+        L.append('  const _vals = (_given !== null && typeof _given === "object")'
+                 ' ? Object.values(_given) : [_given];')
+        call = ('(((_isArr && TARGET.length > 1) || (!_isArr && _vals.length > 1))'
+                ' ? TARGET(..._vals) : TARGET(_isArr ? _given : (_vals[0] !== undefined ? _vals[0] : _given)))')
         if raises:
             exc = _exc_name(raises) or 'Error'
-            L.append('  assert.throws(() => { TARGET%s; }, /%s/);'
-                     % (args, re.escape(exc)))
+            L.append('  assert.throws(() => { %s; }, /%s/);'
+                     % (call, re.escape(exc)))
             L.append('});')
             continue
-        L.append('  const actual = TARGET%s;' % args)
+        L.append('  const actual = %s;' % call)
         for line in _js_expect_block(expect):
             L.append('  ' + line)
         L.append('});')

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import json
 import os
 import re
@@ -137,7 +138,7 @@ def _iter_files(out_dir):
         dirnames.sort()
         # Prune noise dirs deterministically (still deterministic if kept,
         # but caches would pollute file counts).
-        for noisy in ('__pycache__', '.git', '.hg', 'node_modules/.cache'):
+        for noisy in ('__pycache__', '.git', '.hg', 'node_modules', '.cache'):
             if noisy in dirnames:
                 dirnames.remove(noisy)
         for name in sorted(filenames):
@@ -158,6 +159,34 @@ def _iter_files(out_dir):
     return found
 
 
+def _manifest_sig(out_dir):
+    """Cheap staleness key over the handful of manifest paths."""
+    root = Path(out_dir)
+    sig = []
+    for cand in ('requirements.txt', 'requirements-dev.txt', 'pyproject.toml',
+                 'package.json'):
+        for p in [root / cand] + sorted(root.glob('requirements/*.txt')) \
+                if cand.startswith('requirements') else [root / cand]:
+            try:
+                st = p.stat()
+                sig.append((p.as_posix(), st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append((p.as_posix(), None, None))
+    return tuple(sig)
+
+
+def _declared_third_party_cached(out_dir):
+    key = (os.path.abspath(out_dir), _manifest_sig(out_dir))
+    if os.environ.get('EPSILON_NO_CACHE') != '1' and key in _MANIFEST_CACHE:
+        return _MANIFEST_CACHE[key]
+    out = _declared_third_party(out_dir)
+    if os.environ.get('EPSILON_NO_CACHE') != '1':
+        _MANIFEST_CACHE[key] = out
+        if len(_MANIFEST_CACHE) > 64:
+            _MANIFEST_CACHE.clear()
+    return out
+
+
 def _source_files(out_dir):
     files = _iter_files(out_dir)
     py = [p for p in files if p.suffix.lower() in _PY_SUFFIXES]
@@ -168,10 +197,70 @@ def _source_files(out_dir):
 
 def _read_text(path):
     # Deterministic encoding handling: utf-8, then utf-8-sig, else error.
+    # Content-cached (keyed by path+mtime+size); set EPSILON_NO_CACHE=1 to
+    # bypass for measurements.
+    if os.environ.get('EPSILON_NO_CACHE') != '1':
+        key = _fkey(path)
+        hit = _TEXT_CACHE.get(key)
+        if hit is not None:
+            return hit
     with open(path, 'r', encoding='utf-8') as f:
-        return f.read()
+        text = f.read()
+    if os.environ.get('EPSILON_NO_CACHE') != '1':
+        _TEXT_CACHE[_fkey(path)] = text
+        if len(_TEXT_CACHE) > 2000:
+            _TEXT_CACHE.clear()
+    return text
 
 
+_TEXT_CACHE: dict = {}
+_TREE_CACHE: dict = {}
+_TOOL_PATHS: dict = {}
+_MANIFEST_CACHE: dict = {}
+
+
+def _fkey(path):
+    try:
+        st = os.stat(path)
+        return (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (os.path.abspath(path), None, None)
+
+
+def _cached_tree(path):
+    """Parse once per file version. Returns (tree|None, error|None).
+
+    Shares one entry per (path, mtime, size); repair edits change mtime+size
+    so entries self-invalidate. Never raises.
+    """
+    key = _fkey(path)
+    if os.environ.get('EPSILON_NO_CACHE') != '1' and key in _TREE_CACHE:
+        return _TREE_CACHE[key]
+    try:
+        text = _read_text(path)
+    except Exception as exc:
+        return (None, exc)
+    try:
+        tree = ast.parse(text, filename=os.fspath(path))
+    except SyntaxError as exc:
+        out = (None, exc)
+    else:
+        out = (tree, None)
+    if os.environ.get('EPSILON_NO_CACHE') != '1':
+        _TREE_CACHE[key] = out
+        if len(_TREE_CACHE) > 2000:
+            _TREE_CACHE.clear()
+    return out
+
+
+def _tool(name):
+    """shutil.which, memoized per process (paths don't move mid-run)."""
+    if name not in _TOOL_PATHS:
+        _TOOL_PATHS[name] = shutil.which(name)
+    return _TOOL_PATHS[name]
+
+
+@functools.lru_cache(maxsize=1)
 def _stdlib_names():
     names = getattr(sys, 'stdlib_module_names', None)
     if names:
@@ -354,7 +443,7 @@ def _collect_py_imports(tree):
 # ---------------------------------------------------------------------------
 
 def _check_js_syntax(path):
-    node = shutil.which('node')
+    node = _tool('node')
     if node is None:
         return ('unknown', None, 'node not found; cannot verify JavaScript syntax')
     try:
@@ -380,7 +469,7 @@ def _check_js_syntax(path):
 
 
 def _check_ts_syntax(path):
-    tsc = shutil.which('tsc')
+    tsc = _tool('tsc')
     if tsc is None:
         return ('unavailable', None, 'tsc not found; TypeScript check unavailable')
     try:
@@ -422,6 +511,7 @@ def _validate_syntax_layer(out_dir, events=None):
             continue
         try:
             compile(src, os.fspath(path), 'exec')
+            _cached_tree(path)  # prime the shared parse for later layers
         except SyntaxError as exc:
             errors.append(err(
                 SYNTAX, 'syntax error: %s' % (exc.msg or 'invalid syntax'),
@@ -493,20 +583,17 @@ def _validate_syntax_layer(out_dir, events=None):
 
 def _ast_check_file(path, rel):
     file_errors = []
-    try:
-        src = _read_text(path)
-    except Exception as exc:
-        return [err(AST_VALIDITY, 'cannot read file: %s' % exc, source_file=rel,
+    tree, perr = _cached_tree(path)
+    if perr is not None and tree is None:
+        if isinstance(perr, SyntaxError):
+            # Syntax layer owns this; still record so the ast layer is honest.
+            return [err(AST_VALIDITY, 'unparseable (syntax error): %s' % (perr.msg or ''),
+                         source_file=rel, line=perr.lineno, col=perr.offset,
+                         probable_cause='invalid Python syntax',
+                         suggested_repair='fix syntax error first')]
+        return [err(AST_VALIDITY, 'cannot read file: %s' % perr, source_file=rel,
                     probable_cause='unreadable file',
                     suggested_repair='fix file permissions/encoding')]
-    try:
-        tree = ast.parse(src, filename=os.fspath(path))
-    except SyntaxError as exc:
-        # Syntax layer owns this; still record so the ast layer is honest.
-        return [err(AST_VALIDITY, 'unparseable (syntax error): %s' % (exc.msg or ''),
-                     source_file=rel, line=exc.lineno, col=exc.offset,
-                     probable_cause='invalid Python syntax',
-                     suggested_repair='fix syntax error first')]
     # 1. empty function bodies (only pass / docstring / ellipsis).
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -565,12 +652,10 @@ def _validate_ast_layer(out_dir, events=None):
         rel = _rel(out_dir, p)
         file_errors = _ast_check_file(p, rel)
         errors.extend(file_errors)
-        try:
-            tree = ast.parse(_read_text(p))
+        tree, _perr = _cached_tree(p)
+        if tree is not None:
             funcs += sum(1 for n in ast.walk(tree)
                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
-        except Exception:
-            pass
     errors.sort(key=lambda e: (e.source_file, e.line or 0, e.symbol))
     state = FAIL if errors else PASS
     v = Verdict(layer=LAYER_AST, state=state, errors=errors,
@@ -607,7 +692,7 @@ def _resolve_relative(out_dir, importer, module, level):
 
 def _validate_imports_layer(out_dir, events=None):
     stdlib = _stdlib_names()
-    declared, manifest = _declared_third_party(out_dir)
+    declared, manifest = _declared_third_party_cached(out_dir)
     py_files, _, _ = _source_files(out_dir)
     errors = []
     checked = 0
@@ -615,9 +700,8 @@ def _validate_imports_layer(out_dir, events=None):
     for path in sorted(p.as_posix() for p in py_files):
         p = Path(path)
         rel = _rel(out_dir, p)
-        try:
-            tree = ast.parse(_read_text(p))
-        except Exception:
+        tree, _perr = _cached_tree(p)
+        if tree is None:
             continue  # syntax layer reports this
         for item in _collect_py_imports(tree):
             mod, level, lineno = item['module'], item['level'], item['lineno']
@@ -1041,18 +1125,16 @@ def _collect_module_bindings(tree):
 
 
 def _check_file_symbols(path, rel):
-    try:
-        src = _read_text(path)
-    except Exception as exc:
-        return [err(SYMBOLS, 'cannot read file: %s' % exc, source_file=rel,
-                    probable_cause='unreadable file',
-                    suggested_repair='fix file permissions/encoding')], set()
-    try:
-        tree = ast.parse(src, filename=os.fspath(path))
-    except SyntaxError:
+    tree, perr = _cached_tree(path)
+    if tree is None:
+        if perr is not None and not isinstance(perr, SyntaxError):
+            return [err(SYMBOLS, 'cannot read file: %s' % perr, source_file=rel,
+                        probable_cause='unreadable file',
+                        suggested_repair='fix file permissions/encoding')], set()
         return [], set()  # syntax layer owns this; stay silent, never guess
+    bindings = set(_collect_module_bindings(tree))  # computed once, reused
     builder = ScopeBuilder(filename=rel)
-    builder.scopes[0].bindings = {n: True for n in _collect_module_bindings(tree)}
+    builder.scopes[0].bindings = {n: True for n in bindings}
     try:
         builder.visit(tree)
     except Exception as exc:
@@ -1060,8 +1142,7 @@ def _check_file_symbols(path, rel):
                                   source_file=rel,
                                   probable_cause='internal walker error',
                                   suggested_repair='report validator bug'))
-    top_defs = set(_collect_module_bindings(tree))
-    return builder.errors, top_defs
+    return builder.errors, bindings
 
 
 def resolve_project_symbols(out_dir):
@@ -1080,9 +1161,8 @@ def resolve_project_symbols(out_dir):
     trees = {}
     for path in py_files:
         rel = _rel(out_dir, path)
-        try:
-            tree = ast.parse(_read_text(path), filename=os.fspath(path))
-        except Exception:
+        tree, _perr = _cached_tree(path)
+        if tree is None:
             continue
         trees[path] = tree
         defs_by_module[path] = set(_collect_module_bindings(tree))
@@ -1176,9 +1256,8 @@ def _discover_test_files(out_dir):
 
 
 def _count_py_test_cases(path):
-    try:
-        tree = ast.parse(_read_text(path))
-    except Exception:
+    tree, _perr = _cached_tree(path)
+    if tree is None:
         return 0
     return sum(1 for n in ast.walk(tree)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1191,9 +1270,8 @@ def _third_party_imports(out_dir):
     py_files, _, _ = _source_files(out_dir)
     used = {}
     for path in sorted(p.as_posix() for p in py_files):
-        try:
-            tree = ast.parse(_read_text(Path(path)))
-        except Exception:
+        tree, _perr = _cached_tree(Path(path))
+        if tree is None:
             continue
         for item in _collect_py_imports(tree):
             if item['level']:
@@ -1229,7 +1307,7 @@ def _validate_structure_layer(out_dir, project, config, events=None):
                 STRUCTURE, "entry file '%s' does not exist" % entry,
                 source_file=str(entry), probable_cause='entry path wrong or file not generated',
                 suggested_repair='fix entry path'))
-    declared, manifest = _declared_third_party(out_dir)
+    declared, manifest = _declared_third_party_cached(out_dir)
     used = _third_party_imports(out_dir)
     for norm in sorted(used):
         if norm not in declared:
@@ -1278,7 +1356,7 @@ def _validate_structure_layer(out_dir, project, config, events=None):
 # ---------------------------------------------------------------------------
 
 def _validate_types_layer(out_dir, config=None, events=None):
-    mypy = shutil.which('mypy')
+    mypy = _tool('mypy')
     if mypy is None:
         v = Verdict(layer=LAYER_TYPES, state=UNAVAILABLE, errors=[],
                     details={'reason': 'mypy not installed; type check not performed'})

@@ -56,3 +56,27 @@ jobs:
         run: |
           PYTHONPATH=. python -m epsilon single "function add(a, b) returns sum"
           PYTHONPATH=. python -m epsilon generate "Todo CLI with JSON storage" --out "$RUNNER_TEMP/epsmoke" --max-iterations 2 | python -c "import json,sys; d=json.load(sys.stdin); print('smoke:', d['state']); assert d['state'] in ('PASS','UNKNOWN'), d['state']"
+      - name: Language matrix (28 render targets)
+        if: matrix.python == '3.12'
+        run: |
+          PYTHONPATH=. python bench/lang_matrix.py > langs.json
+          python -c "
+          import json
+          d = json.load(open('langs.json'))
+          print('langs rendered:', d['rendered'], '/', d['total'])
+          bad = [r for r in d['results'] if not r['render_ok'] or r['verify'] == 'FAIL']
+          assert not bad, bad
+          assert d['rendered'] >= 27, d['rendered']
+          "
+      - name: SWE-mini repair bench (harness health)
+        if: matrix.python == '3.12'
+        run: |
+          PYTHONPATH=.:bench python bench/swe_mini.py > swe.json || true
+          python -c "
+          import json
+          d = json.load(open('swe.json'))
+          print('swe-mini resolved:', d['resolved'], '/', d['total'])
+          assert d['total'] == 8, d['total']
+          bad = [r for r in d['results'] if r['category'].startswith('infra-') or r['category'] == 'contaminated']
+          assert not bad, bad
+          "

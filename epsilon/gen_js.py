@@ -46,8 +46,12 @@ class JsBackend:
         return out
 
     def render_file(self, src) -> str:
-        ctx = {'declared': set(), 'reassigned': set(), 'need_range': False, 'need_set_has': False}
+        ctx = {'declared': set(), 'reassigned': set(), 'need_range': False, 'need_set_has': False,
+               'dict_vars': set()}
         _scan_reassigned(getattr(src, 'declarations', []) or [], getattr(src, 'main_block', []) or [], ctx)
+        for d in getattr(src, 'declarations', []) or []:
+            if type(d).__name__ == 'VarDecl' and getattr(getattr(d, 'type', None), 'name', '') == 'dict':
+                ctx['dict_vars'].add(d.name)
         L: list[str] = []
         if getattr(src, 'doc', ''):
             L.append('/** %s */' % src.doc.replace('*/', '*\\/'))
@@ -114,6 +118,15 @@ class JsBackend:
 
     def _func(self, f, lvl: int, ctx) -> str:
         p = _pad(lvl)
+        saved_dicts = set(ctx.get('dict_vars', set()))
+        local = set(saved_dicts)
+        for prm in getattr(f, 'params', []) or []:
+            if getattr(getattr(prm, 'type', None), 'name', '') == 'dict':
+                local.add(prm.name)
+        for st in getattr(f, 'body', []) or []:
+            _collect_dict_vars(st, local)
+        ctx['dict_vars'] = local
+        ctx['dict_vars'] = local
         lines = self._jsdoc(f, lvl)
         kw = 'async function' if getattr(f, 'is_async', False) else 'function'
         parts = []
@@ -134,6 +147,7 @@ class JsBackend:
         for s in body:
             lines.append(self.render_stmt(s, lvl + 1, ctx))
         lines.append('%s}' % p)
+        ctx['dict_vars'] = saved_dicts
         return '\n'.join(lines)
 
     def _class(self, c, lvl: int, ctx) -> str:
@@ -266,8 +280,12 @@ class JsBackend:
                 out.append('%s}' % p)
             return '\n'.join(out)
         if kind == 'Raise':
-            msg = self.render_expr(s.message, ctx) if s.message is not None else '"error"'
-            return '%sthrow new %s(%s);' % (p, s.exc if s.exc != 'Exception' else 'Error', msg)
+            msg = self.render_expr(s.message, ctx) if s.message is not None else '""'
+            if s.exc in ('ValueError', 'TypeError', 'KeyError', 'IndexError',
+                         'NotImplementedError', 'AssertionError', 'Exception'):
+                return '%sthrow new Error(%s + ": " + (%s));' % (
+                    p, _json.dumps(s.exc), msg)
+            return '%sthrow new %s(%s);' % (p, s.exc, msg)
         if kind == 'Assert':
             cond = self.render_expr(s.cond, ctx)
             msg = self.render_expr(s.message, ctx) if s.message is not None else '"assertion failed"'
@@ -367,7 +385,9 @@ class JsBackend:
                 test = '%s.has(%s)' % (r, l)
             elif right_kind == 'Var' and e.right.name in ctx.get('set_vars', set()):
                 test = '%s.has(%s)' % (r, l)
-            elif right_kind == 'DictLit':
+            elif right_kind == 'DictLit' or (
+                    right_kind == 'Var'
+                    and e.right.name in ctx.get('dict_vars', set())):
                 test = '(%s in %s)' % (l, r)
             else:
                 test = '%s.includes(%s)' % (r, l)
@@ -383,7 +403,9 @@ class JsBackend:
         if fkind == 'Var':
             name = e.func.name
             if name == 'len' and len(args) == 1 and not kwargs:
-                return '(%s.length)' % args[0]
+                return '((%s.length !== undefined) ? (%s.length) : (Object.keys(%s).length))' % (args[0], args[0], args[0])
+            if name == 'list' and len(args) == 1 and not kwargs:
+                return 'Array.from(%s)' % args[0]
             if name == 'reversed' and len(args) == 1 and not kwargs:
                 x = args[0]
                 return ('((typeof %(x)s === "string") ? %(x)s.split("").reverse().join("")'
@@ -416,13 +438,20 @@ class JsBackend:
             if name == 'print' and not kwargs:
                 return 'console.log(%s)' % ', '.join(args)
             if name in ('ValueError', 'TypeError', 'KeyError', 'IndexError', 'NotImplementedError'):
-                return 'new Error(%s)' % (args[0] if args else '""')
+                inner = args[0] if args else '""'
+                return 'new Error(%s + ": " + (%s))' % (_json.dumps(name), inner)
             all_args = args + kwargs
             return '%s(%s)' % (name, ', '.join(all_args))
         if fkind == 'Attr' and e.func.attr == 'append' and len(args) == 1 and not kwargs:
             return '%s.push(%s)' % (self.render_expr(e.func.obj, ctx), args[0])
         if fkind == 'Attr' and e.func.attr == 'add' and len(args) == 1 and not kwargs:
             return '%s.add(%s)' % (self.render_expr(e.func.obj, ctx), args[0])
+        if fkind == 'Attr' and e.func.attr == 'pop' and len(args) == 2 and not kwargs:
+            obj = self.render_expr(e.func.obj, ctx)
+            return '((%s) in (%s) ? (delete (%s)[%s], true) : null)' % (
+                args[0], obj, obj, args[0])
+        if fkind == 'Attr' and e.func.attr == 'values' and not args and not kwargs:
+            return 'Object.values(%s)' % self.render_expr(e.func.obj, ctx)
         base = self.render_expr(e.func, ctx)
         return '%s(%s)' % (base, ', '.join(args + kwargs))
 
@@ -509,6 +538,28 @@ def _free_vars(e) -> set:
             out |= _free_vars(k) | _free_vars(v)
         return out
     return set()
+
+
+def _collect_dict_vars(st, local: set) -> None:
+    """Record dict-typed locals, recursing into nested blocks (if/loop
+    branches assign too — e.g. store resolution idioms)."""
+    kind = type(st).__name__
+    if kind == 'Assign':
+        v = getattr(st, 'value', None)
+        if type(v).__name__ == 'DictLit':
+            local.add(st.target)
+        elif type(v).__name__ == 'Var' and v.name in local:
+            local.add(st.target)  # dict alias: store = _STORE / records
+        return
+    for key in ('then', 'else_body', 'body', 'finally_body'):
+        for x in getattr(st, key, []) or []:
+            _collect_dict_vars(x, local)
+    for _c, b in getattr(st, 'elifs', []) or []:
+        for x in b or []:
+            _collect_dict_vars(x, local)
+    for h in getattr(st, 'handlers', []) or []:
+        for x in getattr(h, 'body', []) or []:
+            _collect_dict_vars(x, local)
 
 
 def _scan_reassigned(decls: list, main: list, ctx) -> None:
