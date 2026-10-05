@@ -20,10 +20,14 @@ def test_pinned_version_matches_repo():
                            'EVAL_VERSION.json')) as fh:
         import json
         pinned = json.load(fh)
-    head = subprocess.check_output(
-        ['git', '-C', os.path.join(os.path.dirname(__file__), '..'),
-         'rev-parse', 'HEAD'], text=True).strip()
-    assert pinned['epsilon_commit'] == head, (pinned['epsilon_commit'], head)
+    repo = os.path.join(os.path.dirname(__file__), '..')
+    pinned_commit = pinned['epsilon_commit']
+    # Ancestry, not equality: committing the pin itself moves HEAD, so the
+    # pin means "results produced by this reachable commit", never "== HEAD".
+    rc = subprocess.call(
+        ['git', '-C', repo, 'merge-base', '--is-ancestor',
+         pinned_commit, 'HEAD'])
+    assert rc == 0, (pinned_commit, 'not reachable from HEAD')
     assert pinned['dataset'] == 'livecodebench/code_generation_lite'
     assert len(pinned['dataset_sha']) == 40
 

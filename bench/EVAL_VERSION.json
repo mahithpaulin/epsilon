@@ -1,1 +1,17 @@
-{"epsilon_version": "2.0.0", "epsilon_commit": "97aeb71609cd5e457049b7cb6ade59ad8b73d251", "eval_date": "2026-10-05", "dataset": "livecodebench/code_generation_lite", "dataset_sha": "0fe84c3912ea0c4d4a78037083943e8f0c4dd505", "dataset_last_modified": "2025-06-05T17:18:27.000Z", "subsample": "first 6 complete problems of test.jsonl (real private tests decoded from the published zlib+base64 blobs via a class-restricted unpickler; public tests verbatim)", "problems": ["A. Short Sort", "B. Good Kid", "D. 1D Eraser", "B. Chemistry", "C. Raspberries", "A. Game with Integers"]}
+{
+  "epsilon_version": "2.0.0",
+  "epsilon_commit": "2c1d776ff10ece2d8e0b0db0d3b389f72c97c350",
+  "eval_date": "2026-10-05",
+  "dataset": "livecodebench/code_generation_lite",
+  "dataset_sha": "0fe84c3912ea0c4d4a78037083943e8f0c4dd505",
+  "dataset_last_modified": "2025-06-05T17:18:27.000Z",
+  "subsample": "first 6 complete problems of test.jsonl (real private tests decoded from the published zlib+base64 blobs via a class-restricted unpickler; public tests verbatim)",
+  "problems": [
+    "A. Short Sort",
+    "B. Good Kid",
+    "D. 1D Eraser",
+    "B. Chemistry",
+    "C. Raspberries",
+    "A. Game with Integers"
+  ]
+}
