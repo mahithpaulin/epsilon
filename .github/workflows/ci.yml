@@ -31,7 +31,9 @@ jobs:
       - name: Pytest (unit/integration/e2e/regression/adversarial)
         run: pytest -q -p no:cacheprovider
       - name: Legacy parity bench (mbpp mini)
-        run: PYTHONPATH=. python bench/mbpp_mini.py > mbpp.json || true; python -c "
+        run: |
+          PYTHONPATH=. python bench/mbpp_mini.py > mbpp.json || true
+          python -c "
           import json
           raw = open('mbpp.json').read()
           d = json.loads(raw[:raw.index(chr(10)+'}'+chr(10))+3])
@@ -40,7 +42,9 @@ jobs:
           assert not bad, bad
           "
       - name: Capability bench (10 levels)
-        run: PYTHONPATH=. PYTHONPATH=.:bench python bench/capability.py > cap.json; python -c "
+        run: |
+          PYTHONPATH=. PYTHONPATH=.:bench python bench/capability.py > cap.json
+          python -c "
           import json
           d = json.load(open('cap.json'))
           print('capability:', d['totals']['passed'], '/', d['totals']['total'])
