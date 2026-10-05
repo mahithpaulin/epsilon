@@ -229,7 +229,10 @@ def run_task(task, lang='python'):
         rec['detail'] = 'baseline build crashed: %s' % e
         return rec
     if report.state != 'PASS':
-        rec['detail'] = 'baseline not green: %s' % report.state
+        vdown = [(v.layer, v.state) for v in report.verdicts]
+        rec['detail'] = 'baseline not green: %s verdicts=%s tests=%s/%s sys=%s' % (
+            report.state, vdown, (report.tests or {}).get('passed'),
+            (report.tests or {}).get('total'), sys.version.split()[0])
         rec['category'] = 'infra-baseline'
         return rec
     base_tests = _run_suite(out_dir)
