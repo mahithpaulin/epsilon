@@ -1,48 +1,56 @@
-"""Epsilon v1 — symbolic coding engine. Python + JavaScript, syntax-verified."""
-from .parser import parse
-from .ir import validate_module
-from . import pyemit, jsemit, verify, ranker
+"""Epsilon v2 — general symbolic code-generation engine.
 
-__version__ = '1.0.0'
-RANKER_PARAMS = ranker.PARAMS  # 21
+Native path: requirements.analyze -> planner.plan_project -> pipeline.build
+(multi-file projects with validation, tests, repair). The v1 single-function
+API is preserved via compat_v1 (legacy adapter, not core architecture).
+"""
+from .errors import (PASS, FAIL, UNKNOWN, UNAVAILABLE, EpsilonError, Verdict,
+                     ProjectReport, err, warn)
+from .config import EpsilonConfig
+from .events import EventLog, Event
+from . import hir
+from . import expr as exprlang
+from . import validate
+from . import requirements
+from . import planner
+from . import pipeline
+from . import sandbox
+from . import repair
+from . import backends
+from . import snippets
+from . import testgen
+from . import context
+from . import deps
+from . import compat_v1
 
+verify = validate  # legacy alias: `from epsilon import verify` keeps working
+
+__version__ = '2.0.0'
+
+
+def build_project(spec, language='python', out_dir='dist', **options):
+    """Native v2 entry: spec text -> verified multi-file project on disk."""
+    from .pipeline import build
+    config = EpsilonConfig(target_language=language, out_dir=out_dir,
+                           **{k: v for k, v in options.items()
+                               if k in EpsilonConfig.__dataclass_fields__})
+    events = EventLog()
+    return build(spec, config, events)
+
+
+# ---- v1 compatibility (legacy adapter) ----
 
 def generate(spec, lang='python', rank=True):
-    lang = (lang or 'python').lower()
-    if lang not in ('python', 'js', 'javascript'):
-        raise ValueError("unsupported lang %r: expected python|js" % lang)
-    if lang == 'javascript':
-        lang = 'js'
-    if not (spec or '').strip():
-        raise ValueError('empty spec')
-    parsed = parse(spec)
-    ir = parsed['ir']
-    errs = validate_module(ir)
-    if errs:
-        raise ValueError('IR invalid: %s' % errs[:3])
-    if lang == 'python':
-        code = pyemit.synthesize(ir)
-        verdict = verify.verify_python(code)
-    else:
-        code = jsemit.synthesize(ir)
-        verdict = verify.verify_js(code)
-    # ranker is a re-ranker only; single candidate in v1 so it acts as scorer.
-    # Kept for API honesty: score reported, output unchanged (no alternative
-    # candidates to choose from in v1 deterministic synthesis).
-    rscore = None
-    if rank:
-        try:
-            ranker.ensure_trained()
-            rscore = ranker.score(ranker.extract(code))
-        except Exception:
-            rscore = None
-    return {'code': code, 'ir': ir, 'verdict': verdict,
-            'meta': parsed.get('meta', {}), 'rank_score': rscore,
-            'ranker_params': RANKER_PARAMS}
+    from .compat_v1 import generate as _gen
+    return _gen(spec, lang=lang)
 
 
 def verify_code(code, lang='python'):
-    lang = (lang or 'python').lower()
-    if lang in ('js', 'javascript'):
-        return verify.verify_js(code)
-    return verify.verify_python(code)
+    from . import validate as V
+    language = (lang or 'python').lower()
+    verdicts = V.validate_file_content(code, language)
+    syntax_ok = all(v.state == PASS for v in verdicts)
+    return {'lang': language, 'syntax_ok': bool(syntax_ok), 'exec_ok': False,
+            'exec_state': 'UNKNOWN',
+            'errors': [e.to_dict() if hasattr(e, 'to_dict') else e
+                       for v in verdicts for e in v.errors]}

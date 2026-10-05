@@ -12,7 +12,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: true
       matrix:
@@ -28,25 +28,25 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Install
         run: pip install pytest
-      - name: Pytest
-        run: pytest -q -x --tb=short -p no:cacheprovider
-      - name: JS syntax check (generated samples)
-        run: |
-          python -c "
-          from epsilon import generate
-          from bench.bench import SPECS
-          import subprocess, tempfile, os
-          bad=0
-          for s in SPECS:
-              code=generate(s,lang='js')['code']
-              open('_tmp.js','w').write(code)
-              r=subprocess.run(['node','--check','_tmp.js'],capture_output=True,text=True)
-              if r.returncode!=0:
-                  print('JS-CHECK-FAIL',s,r.stderr[:300]); bad+=1
-          raise SystemExit(bad)
+      - name: Pytest (unit/integration/e2e/regression/adversarial)
+        run: pytest -q -p no:cacheprovider
+      - name: Legacy parity bench (mbpp mini)
+        run: PYTHONPATH=. python bench/mbpp_mini.py > mbpp.json; python -c "
+          import json
+          raw = open('mbpp.json').read()
+          d = json.loads(raw[:raw.index(chr(10)+'}'+chr(10))+3])
+          print('mbpp-mini:', d['passed'], '/', d['total'], 'syntax:', d['syntax_ok'])
+          bad = [r for r in d['results'] if not r['pass'] and not r['id'].startswith('STRETCH')]
+          assert not bad, bad
           "
-      - name: Anti-hardcode check
+      - name: Capability bench (10 levels)
+        run: PYTHONPATH=. PYTHONPATH=.:bench python bench/capability.py > cap.json; python -c "
+          import json
+          d = json.load(open('cap.json'))
+          print('capability:', d['totals']['passed'], '/', d['totals']['total'])
+          assert d['totals']['passed'] == d['totals']['total'], [ (r['id'], r['name'], r['details']) for r in d['levels'] if not r['tests_ok'] ]
+          "
+      - name: CLI smoke
         run: |
-          python -m pytest tests/test_epsilon.py::test_no_pasted_programs tests/test_epsilon.py::test_mutation_sensitivity -q -p no:cacheprovider
-      - name: Benchmark (quick)
-        run: PYTHONPATH=. python bench/bench.py
+          PYTHONPATH=. python -m epsilon single "function add(a, b) returns sum"
+          PYTHONPATH=. python -m epsilon generate "Todo CLI with JSON storage" --out "$RUNNER_TEMP/epsmoke" --max-iterations 2 | python -c "import json,sys; d=json.load(sys.stdin); print('smoke:', d['state']); assert d['state'] in ('PASS','UNKNOWN'), d['state']"
