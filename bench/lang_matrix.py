@@ -60,8 +60,9 @@ def _verify(lang, code, ext):
                 fh.write(code)
                 path = fh.name
             try:
-                r = subprocess.run(['tsc', '--noEmit', path],
-                                   capture_output=True, text=True, timeout=30)
+                r = subprocess.run(
+                    ['tsc', '--noEmit', '--module', 'commonjs', path],
+                    capture_output=True, text=True, timeout=30)
                 msg = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()[:300]
                 return ('PASS', '') if r.returncode == 0 else (
                     'FAIL', msg)
