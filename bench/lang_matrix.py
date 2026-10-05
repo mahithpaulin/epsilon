@@ -62,8 +62,9 @@ def _verify(lang, code, ext):
             try:
                 r = subprocess.run(['tsc', '--noEmit', path],
                                    capture_output=True, text=True, timeout=30)
+                msg = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()[:300]
                 return ('PASS', '') if r.returncode == 0 else (
-                    'FAIL', r.stderr[:200])
+                    'FAIL', msg)
             except subprocess.TimeoutExpired:
                 return 'UNKNOWN', 'tsc timeout'
             finally:

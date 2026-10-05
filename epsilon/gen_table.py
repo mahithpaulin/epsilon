@@ -311,6 +311,8 @@ class TableBackend:
             t = self._type(returns)
             if self.s.name == 'rust':
                 return (' -> ' + t) if t else ''
+            if self.s.name == 'php':
+                return (': ' + t) if t else ''
             if self.s.name in ('go',):
                 return (' ' + t) if t else ''
             if self.s.name == 'haskell':
