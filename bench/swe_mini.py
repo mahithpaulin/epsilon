@@ -199,11 +199,23 @@ def _symptom(cur):
 
 
 def _failing_specs(res):
+    """Test FILE paths (out_dir-relative) with failures, mapped precisely
+    from unittest's `FAIL: method (module.Class.method)` headers.
+
+    Method-name substring matching is banned here: identical notes produce
+    identical method names across files, which used to pollute F2P with
+    innocent files and invalidate every split.
+    """
     out = set()
     for line in (res.get('stderr', '') + '\n' + res.get('stdout', '')).split('\n'):
-        m = re.search(r'(ERROR|FAIL): (\w+)', line)
-        if m:
-            out.add(m.group(2))
+        m = re.search(r'(?:ERROR|FAIL): \w+ \(([\w.]+)\.', line.strip())
+        if not m:
+            continue
+        parts = m.group(1).split('.')
+        if parts[0] == 'tests' and len(parts) > 1:
+            out.add('tests/%s.py' % parts[1])
+        elif parts[0].startswith('test_'):
+            out.add('tests/%s.py' % parts[0])
     return out
 
 
@@ -259,7 +271,7 @@ def run_task(task, lang='python'):
     # inject defect (adaptive: first kind x occurrence with a valid split)
     with open(target) as fh:
         pristine = fh.read()
-    hidden_dir = tempfile.mkdtemp(prefix='eps-swe-hidden-')
+    all_specs = _test_files(out_dir)
     valid = False
     applied = ('', 0)
     for kind in DEFECT_ORDER:
@@ -273,13 +285,13 @@ def run_task(task, lang='python'):
             buggy = _run_suite(out_dir)
             if buggy.get('state') == 'PASS':
                 continue  # defect didn't break anything; try next site
-            # F2P = test FILES with failures; hide them (harness-only)
-            fail_specs = _failing_specs(buggy)
-            all_specs = _test_files(out_dir)
-            f2p = [p for p in all_specs
-                   if os.path.basename(p)[:-3] in fail_specs or (
-                       fail_specs and _spec_fails(p, fail_specs))]
-            f2p = sorted(set(f2p))
+            # F2P = test FILES with failures (module-precise); hide them.
+            # P2P = the rest. Both must be non-empty (SWE-bench validation).
+            fail_files = _failing_specs(buggy)
+            by_rel = {}
+            for p in all_specs:
+                by_rel[os.path.relpath(p, out_dir)] = p
+            f2p = sorted(by_rel[r] for r in fail_files if r in by_rel)
             p2p = [p for p in all_specs if p not in f2p]
             if f2p and p2p:
                 valid = True
