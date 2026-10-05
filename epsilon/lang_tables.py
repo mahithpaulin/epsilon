@@ -148,7 +148,7 @@ PHP = LangSpec(
     name='php', display='PHP', ext='.php', comment='//', tier='general',
     types=_t(int='int', float='float', str='string', bool='bool',
              list='array', dict='array', none='null', any='mixed'),
-    func='function {name}({params}){ret} {', param='{type} ${name}',
+    func='function {name}({params}){ret} {', param='{type} {name}',
     var='${name} = {val};', sigil='$',
     print_='echo {args};', class_style='full', try_='try {',
     interp='"$x"', check=('php', '-l', '{file}'), gaps=(),

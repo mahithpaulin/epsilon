@@ -66,7 +66,13 @@ class JsBackend:
             L.append(self.render_stmt(s, 0, ctx))
         exports = _export_names(getattr(src, 'declarations', []) or [])
         if exports:
-            L.append('module.exports = { %s };' % ', '.join(exports))
+            if self.mode == 'ts':
+                # `export =` compiles under tsc without @types/node and
+                # stays require()-compatible (unlike `export` or bare
+                # `module.exports`, which needs node type declarations).
+                L.append('export = { %s };' % ', '.join(exports))
+            else:
+                L.append('module.exports = { %s };' % ', '.join(exports))
         body = '\n'.join(L).rstrip('\n') + '\n'
         if ctx['need_range']:
             body = _RANGE_HELPER + '\n' + body
