@@ -1034,26 +1034,25 @@ def my_cases_for(func, dotted: str, strategy=None) -> list | None:
         return [C({'path': 'eps_missing_xyz.json'}, '[]', note='edge: missing file loads empty'),
                 C({'path': None}, raises='ValueError', note='invalid: null path')]
     # Generic identity fallback: only when enrich took its generic path
-    # (strategy recorded in meta). Anything else keeps planner cases.
-    if strategy != 'generic':
-        return None
-    if not names or 'records' in names:
-        return None
-    _samples = {'int': 3, 'float': 2.5, 'bool': True, 'list': [3, 1, 2],
-                'dict': {'key': 'value'}, 'str': 'sample'}
-    _zeros = {'int': 0, 'float': 0.0, 'bool': False, 'list': [],
-              'dict': {}, 'str': ''}
-    _types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
-              for p in func.params or []}
-    sample = {n: _samples.get(_types.get(n, 'str'), 'sample') for n in names}
-    first = names[0]
-    zero = {n: _zeros.get(_types.get(n, 'str'), '') for n in names}
-    return [C(dict(sample), repr(sample[first]),
-               note='normal: identity over sample input'),
-            C(dict(zero), repr(_zeros.get(_types.get(first, 'str'), '')),
-               note='edge: zero input passes through'),
-            C({first: None}, raises='ValueError',
-               note='invalid: null input raises')]
+    # (strategy recorded in meta). Must come AFTER the dedicated
+    # load_/save_/step/run/api branches below, which own their semantics.
+    _generic_ok = (strategy == 'generic' and names and 'records' not in names)
+    if _generic_ok:
+        _samples = {'int': 3, 'float': 2.5, 'bool': True, 'list': [3, 1, 2],
+                    'dict': {'key': 'value'}, 'str': 'sample'}
+        _zeros = {'int': 0, 'float': 0.0, 'bool': False, 'list': [],
+                  'dict': {}, 'str': ''}
+        _types = {p.name: (p.type.name if getattr(p, 'type', None) else 'str')
+                  for p in func.params or []}
+        sample = {n: _samples.get(_types.get(n, 'str'), 'sample') for n in names}
+        first = names[0]
+        zero = {n: _zeros.get(_types.get(n, 'str'), '') for n in names}
+        return [C(dict(sample), repr(sample[first]),
+                   note='normal: identity over sample input'),
+                C(dict(zero), repr(_zeros.get(_types.get(first, 'str'), '')),
+                   note='edge: zero input passes through'),
+                C({first: None}, raises='ValueError',
+                   note='invalid: null input raises')]
     if low == 'step' and len(names) >= 2:
         return [C({names[0]: {'x': 1}, names[1]: 'tick'}, "{'x': 1}",
                    note='normal: step passes state through'),
