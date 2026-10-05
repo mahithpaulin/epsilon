@@ -75,7 +75,10 @@ class JsBackend:
                 L.append('module.exports = { %s };' % ', '.join(exports))
         body = '\n'.join(L).rstrip('\n') + '\n'
         if ctx['need_range']:
-            body = _RANGE_HELPER + '\n' + body
+            if self.mode == 'ts':
+                body = _RANGE_HELPER_TS + '\n' + body
+            else:
+                body = _RANGE_HELPER + '\n' + body
         return body
 
     # ---- declarations ----
@@ -466,6 +469,16 @@ _RANGE_HELPER = """function __range(start, stop, step) {
   if (stop === undefined) { stop = start; start = 0; }
   if (step === undefined || step === 0) { step = 1; }
   const out = [];
+  if (step > 0) { for (let i = start; i < stop; i += step) { out.push(i); } }
+  else { for (let i = start; i > stop; i += step) { out.push(i); } }
+  return out;
+}"""
+
+
+_RANGE_HELPER_TS = """function __range(start: number, stop?: number, step?: number): number[] {
+  if (stop === undefined) { stop = start; start = 0; }
+  if (step === undefined || step === 0) { step = 1; }
+  const out: number[] = [];
   if (step > 0) { for (let i = start; i < stop; i += step) { out.push(i); } }
   else { for (let i = start; i > stop; i += step) { out.push(i); } }
   return out;
